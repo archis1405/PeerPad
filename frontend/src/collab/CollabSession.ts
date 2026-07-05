@@ -2,6 +2,7 @@ import { Emitter } from '../lib/emitter';
 import { RGADocument } from '../crdt';
 import type { Op } from '../crdt';
 import type { WebRTCManager } from '../net';
+import { appendOp, loadOps } from '../storage';
 import { diffText } from './textDiff';
 
 // The one message shape this layer puts on the data channel: a batch of
@@ -32,16 +33,36 @@ type CollabSessionEvents = {
 // and broadcast; incoming data channel messages are parsed as op batches
 // and applied to the local document. Deliberately knows nothing about
 // React — `on('change', ...)` is the entire interface the UI needs.
+//
+// It also persists every op (local or remote) to IndexedDB, keyed by
+// room, and replays that history into the document before going live —
+// this is the entire mechanism behind surviving a page refresh: the
+// document IS its op log, and reloading just means running that same log
+// through applyOp again from a blank RGADocument.
 export class CollabSession {
   readonly doc: RGADocument;
   private readonly manager: WebRTCManager;
+  private readonly roomId: string;
   private readonly emitter = new Emitter<CollabSessionEvents>();
   private readonly unsubscribe: () => void;
 
-  constructor(siteId: string, manager: WebRTCManager) {
+  private constructor(siteId: string, manager: WebRTCManager, roomId: string) {
     this.doc = new RGADocument(siteId);
     this.manager = manager;
+    this.roomId = roomId;
     this.unsubscribe = manager.on('message', ({ data }) => this.handleRemoteMessage(data));
+  }
+
+  // Async factory rather than a plain constructor: loading persisted
+  // history from IndexedDB is inherently async, and this guarantees the
+  // session is never handed to the UI mid-replay — by the time
+  // `create()` resolves, `doc` already reflects every op this room has
+  // ever seen.
+  static async create(siteId: string, manager: WebRTCManager, roomId: string): Promise<CollabSession> {
+    const session = new CollabSession(siteId, manager, roomId);
+    const persistedOps = await loadOps(roomId);
+    for (const op of persistedOps) session.doc.applyOp(op);
+    return session;
   }
 
   on<K extends keyof CollabSessionEvents>(
@@ -53,7 +74,8 @@ export class CollabSession {
 
   // Called by the UI whenever the textarea's value changes. Diffs against
   // the previously-known text to recover what the user actually did, adds
-  // it to the local RGA, and broadcasts the resulting ops to every peer.
+  // it to the local RGA, persists it, and broadcasts the resulting ops to
+  // every peer.
   applyLocalEdit(oldText: string, newText: string): void {
     const { start, deleteCount, inserted } = diffText(oldText, newText);
     if (deleteCount === 0 && inserted.length === 0) return;
@@ -71,6 +93,7 @@ export class CollabSession {
       ops.push(this.doc.insertAt(start + i, inserted[i]));
     }
 
+    for (const op of ops) void appendOp(this.roomId, op);
     this.manager.broadcast(JSON.stringify({ kind: 'ops', ops } satisfies OpBatchMessage));
     this.emitter.emit('change', { text: this.doc.toText(), remoteEdits: [] });
   }
@@ -103,6 +126,7 @@ export class CollabSession {
         this.doc.applyOp(op);
         if (index !== -1) remoteEdits.push({ index, delta: -1 });
       }
+      void appendOp(this.roomId, op);
     }
 
     this.emitter.emit('change', { text: this.doc.toText(), remoteEdits });
