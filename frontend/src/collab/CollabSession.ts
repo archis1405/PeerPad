@@ -1,18 +1,29 @@
 import { Emitter } from '../lib/emitter';
 import { RGADocument } from '../crdt';
-import type { Op } from '../crdt';
+import type { Op, SiteId } from '../crdt';
 import type { WebRTCManager } from '../net';
 import { appendOp, loadOps } from '../storage';
 import { diffText } from './textDiff';
 
-// The one message shape this layer puts on the data channel: a batch of
-// CRDT ops. A single keystroke produces a batch of size 1; a paste of 50
-// characters produces a batch of 50 sent as one data channel message
-// rather than 50 separate sends.
+// The two message shapes this layer puts on the data channel.
+//
+// A batch of CRDT ops: a single keystroke produces a batch of size 1; a
+// paste of 50 characters produces a batch of 50 sent as one message.
 interface OpBatchMessage {
   kind: 'ops';
   ops: Op[];
 }
+// "Here's everything I have, by site." Sent the moment a data channel
+// opens — whether that's a brand new peer joining the room for the first
+// time (an empty vector) or a peer reconnecting after being offline (a
+// vector missing whatever happened while it was gone). Either way, the
+// fix is the same: the recipient works out what the sender is missing
+// and sends exactly those ops back.
+interface StateVectorMessage {
+  kind: 'state-vector';
+  vector: Record<SiteId, number>;
+}
+type WireMessage = OpBatchMessage | StateVectorMessage;
 
 // Describes one remote op's effect on visible text, in the same terms a
 // textarea understands (an offset and how much it shifted), so the UI
@@ -39,18 +50,27 @@ type CollabSessionEvents = {
 // this is the entire mechanism behind surviving a page refresh: the
 // document IS its op log, and reloading just means running that same log
 // through applyOp again from a blank RGADocument.
+//
+// And it resyncs whenever a data channel (re)opens: both sides exchange
+// state vectors, and each independently sends whatever ops the other is
+// missing. Because applyOp is already idempotent and order-independent
+// (that's what makes the CRDT a CRDT), catching up after an arbitrary
+// offline period needs no special-casing beyond "figure out what's
+// missing, send it through the same pipe live ops already use."
 export class CollabSession {
   readonly doc: RGADocument;
-  private readonly manager: WebRTCManager;
+  private manager: WebRTCManager;
   private readonly roomId: string;
   private readonly emitter = new Emitter<CollabSessionEvents>();
-  private readonly unsubscribe: () => void;
+  private unsubscribeMessage: () => void;
+  private unsubscribeConnected: () => void;
 
   private constructor(siteId: string, manager: WebRTCManager, roomId: string) {
     this.doc = new RGADocument(siteId);
     this.manager = manager;
     this.roomId = roomId;
-    this.unsubscribe = manager.on('message', ({ data }) => this.handleRemoteMessage(data));
+    this.unsubscribeMessage = manager.on('message', ({ peerId, data }) => this.handleRemoteMessage(peerId, data));
+    this.unsubscribeConnected = manager.on('peer-connected', ({ peerId }) => this.sendStateVector(peerId));
   }
 
   // Async factory rather than a plain constructor: loading persisted
@@ -63,6 +83,26 @@ export class CollabSession {
     const persistedOps = await loadOps(roomId);
     for (const op of persistedOps) session.doc.applyOp(op);
     return session;
+  }
+
+  // Points this session at a new WebRTCManager — used when "going back
+  // online" after a simulated (or real) network drop. Deliberately does
+  // NOT touch `doc`: anything typed while offline is already sitting in
+  // the in-memory document and in IndexedDB, so there's nothing to
+  // reload. The RGA site id (allocated once, in the constructor) is also
+  // untouched, even though the new manager's connections will likely
+  // carry a brand new signaling peer id — site id (who authored this op,
+  // for CRDT ordering) and peer id (which data channel to send to right
+  // now) are different identities on purpose, and a network blip should
+  // only ever change the latter. Once rebound, the usual peer-connected
+  // -> state-vector handshake takes care of resyncing with whoever's
+  // reachable now.
+  rebind(manager: WebRTCManager): void {
+    this.unsubscribeMessage();
+    this.unsubscribeConnected();
+    this.manager = manager;
+    this.unsubscribeMessage = manager.on('message', ({ peerId, data }) => this.handleRemoteMessage(peerId, data));
+    this.unsubscribeConnected = manager.on('peer-connected', ({ peerId }) => this.sendStateVector(peerId));
   }
 
   on<K extends keyof CollabSessionEvents>(
@@ -94,20 +134,50 @@ export class CollabSession {
     }
 
     for (const op of ops) void appendOp(this.roomId, op);
+    // If every peer is currently offline, broadcast() is simply a no-op —
+    // there's no outbox or retry here. That's fine: these ops are already
+    // persisted, so whenever a data channel next opens, the state-vector
+    // exchange below will catch whoever's missing them up from storage.
     this.manager.broadcast(JSON.stringify({ kind: 'ops', ops } satisfies OpBatchMessage));
     this.emitter.emit('change', { text: this.doc.toText(), remoteEdits: [] });
   }
 
   close(): void {
-    this.unsubscribe();
+    this.unsubscribeMessage();
+    this.unsubscribeConnected();
   }
 
-  private handleRemoteMessage(data: string): void {
-    let message: OpBatchMessage;
+  private sendStateVector(peerId: string): void {
+    const vector = this.doc.getStateVector();
+    this.manager.send(peerId, JSON.stringify({ kind: 'state-vector', vector } satisfies StateVectorMessage));
+  }
+
+  // Called when a peer tells us what they have. Loads this room's full
+  // persisted history (not just whatever's in the live tree — same
+  // thing, but storage is the canonical source) and sends back only the
+  // ops whose origin's counter is past what they reported for that site.
+  private async sendMissingOps(peerId: string, theirVector: Record<SiteId, number>): Promise<void> {
+    const allOps = await loadOps(this.roomId);
+    const missing = allOps.filter((op) => {
+      const origin = op.type === 'insert' ? op.id : op.origin;
+      const theirMax = theirVector[origin.site] ?? -1;
+      return origin.counter > theirMax;
+    });
+    if (missing.length === 0) return;
+    this.manager.send(peerId, JSON.stringify({ kind: 'ops', ops: missing } satisfies OpBatchMessage));
+  }
+
+  private handleRemoteMessage(peerId: string, data: string): void {
+    let message: WireMessage;
     try {
       message = JSON.parse(data);
     } catch {
       return; // not JSON we understand; ignore rather than crash the session
+    }
+
+    if (message.kind === 'state-vector') {
+      void this.sendMissingOps(peerId, message.vector);
+      return;
     }
     if (message.kind !== 'ops') return;
 
@@ -122,7 +192,7 @@ export class CollabSession {
       } else {
         // Capture position *before* applying: once deleted, the node no
         // longer shows up in indexOf at all.
-        const index = this.doc.indexOf(op.id);
+        const index = this.doc.indexOf(op.target);
         this.doc.applyOp(op);
         if (index !== -1) remoteEdits.push({ index, delta: -1 });
       }
