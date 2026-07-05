@@ -104,3 +104,48 @@ describe('RGADocument out-of-order delivery', () => {
     expect(doc.toText()).toBe('a');
   });
 });
+
+describe('RGADocument state vector', () => {
+  it('starts empty for a brand new document', () => {
+    const doc = new RGADocument('A');
+    expect(doc.getStateVector()).toEqual({});
+  });
+
+  it('tracks the highest counter seen per site across inserts', () => {
+    const doc = new RGADocument('A');
+    doc.insertAt(0, 'a'); // A's counter 0
+    doc.insertAt(1, 'b'); // A's counter 1
+    expect(doc.getStateVector()).toEqual({ A: 1 });
+  });
+
+  it('advances the vector for a delete using its own origin, not its target', () => {
+    // A delete op references an existing node (its target), but it also
+    // has its own origin — this is exactly why DeleteOp needed an origin
+    // field at all: without one, deletes would be invisible here.
+    const doc = new RGADocument('A');
+    const opA = doc.insertAt(0, 'a'); // A's counter 0
+    doc.markDeleted(opA.id); // A's counter 1 (the delete's own origin)
+    expect(doc.getStateVector()).toEqual({ A: 1 });
+  });
+
+  it('tracks multiple sites independently', () => {
+    const doc = new RGADocument('replica');
+    const opA0 = { type: 'insert' as const, id: { site: 'A', counter: 0 }, value: 'a', parentId: null };
+    const opB0 = { type: 'insert' as const, id: { site: 'B', counter: 0 }, value: 'b', parentId: opA0.id };
+    const opB1 = { type: 'insert' as const, id: { site: 'B', counter: 1 }, value: 'c', parentId: opB0.id };
+    doc.applyOp(opA0);
+    doc.applyOp(opB0);
+    doc.applyOp(opB1);
+    expect(doc.getStateVector()).toEqual({ A: 0, B: 1 });
+  });
+
+  it('records an op as seen even when it is only buffered, not yet integrated', () => {
+    // Without this, a peer that already has an op queued (waiting on its
+    // parent) would look like it's still missing that op, and a
+    // reconnect resync would needlessly resend it.
+    const doc = new RGADocument('replica');
+    const childOp = { type: 'insert' as const, id: { site: 'A', counter: 1 }, value: 'b', parentId: { site: 'A', counter: 0 } };
+    doc.applyOp(childOp); // parent (counter 0) hasn't arrived; this gets buffered
+    expect(doc.getStateVector()).toEqual({ A: 1 });
+  });
+});

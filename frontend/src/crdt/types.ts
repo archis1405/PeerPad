@@ -15,8 +15,15 @@ export interface InsertOp {
 
 export interface DeleteOp {
   readonly type: 'delete';
+  // This delete's own place in its author's sequence — distinct from
+  // `target`. Without its own origin, a delete would be invisible to a
+  // per-site state vector (see RGADocument.getStateVector): the vector
+  // tracks "highest counter I've seen from site X", and a delete that
+  // only carried the id of the node it removes wouldn't consume a slot
+  // in the deleting site's own sequence at all.
+  readonly origin: OpId;
   // The id of the node being deleted (an existing InsertOp's id).
-  readonly id: OpId;
+  readonly target: OpId;
 }
 
 export type Op = InsertOp | DeleteOp;

@@ -56,6 +56,14 @@ export class RGADocument {
   // apply the tombstone the moment the insert shows up.
   private readonly pendingDeletes = new Set<string>();
 
+  // Highest counter seen from each site, across every op (insert or
+  // delete) ever passed through applyOp — this is the document's state
+  // vector, used to figure out what a reconnecting or newly-met peer is
+  // missing (see CollabSession). It's updated even for ops that end up
+  // buffered rather than immediately integrated: once we've received an
+  // op at all, we don't want a peer to resend it to us.
+  private readonly stateVector = new Map<SiteId, number>();
+
   constructor(siteId: SiteId) {
     this.siteId = siteId;
   }
@@ -76,8 +84,12 @@ export class RGADocument {
     return op;
   }
 
-  markDeleted(id: OpId): DeleteOp {
-    const op: DeleteOp = { type: 'delete', id };
+  markDeleted(target: OpId): DeleteOp {
+    const op: DeleteOp = {
+      type: 'delete',
+      origin: { site: this.siteId, counter: this.counter++ },
+      target,
+    };
     this.integrateDelete(op);
     return op;
   }
@@ -135,9 +147,22 @@ export class RGADocument {
     return this.visibleNodesInOrder().findIndex((n) => n === node);
   }
 
+  // Highest counter seen per site, covering both inserts and deletes.
+  // Compared against a peer's own vector during reconnection to work out
+  // what to send them (see CollabSession.sendMissingOps).
+  getStateVector(): Record<SiteId, number> {
+    return Object.fromEntries(this.stateVector);
+  }
+
   // --- Internals ----------------------------------------------------------
 
+  private recordSeen(origin: OpId): void {
+    const current = this.stateVector.get(origin.site) ?? -1;
+    if (origin.counter > current) this.stateVector.set(origin.site, origin.counter);
+  }
+
   private integrateInsert(op: InsertOp): void {
+    this.recordSeen(op.id);
     const key = opIdKey(op.id);
     if (this.nodesById.has(key)) return; // already applied; ops are idempotent
 
@@ -177,11 +202,12 @@ export class RGADocument {
   }
 
   private integrateDelete(op: DeleteOp): void {
-    const node = this.nodesById.get(opIdKey(op.id));
+    this.recordSeen(op.origin);
+    const node = this.nodesById.get(opIdKey(op.target));
     if (node) {
       node.deleted = true;
     } else {
-      this.pendingDeletes.add(opIdKey(op.id));
+      this.pendingDeletes.add(opIdKey(op.target));
     }
   }
 
