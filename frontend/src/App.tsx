@@ -1,11 +1,11 @@
 import './App.css'
-import { ConnectionDemo } from './components/ConnectionDemo'
+import { CollabEditor } from './components/CollabEditor'
 
 function App() {
   return (
     <div className="app-shell">
       <h1>PeerPad</h1>
-      <ConnectionDemo />
+      <CollabEditor />
     </div>
   )
 }

@@ -1,4 +1,4 @@
-import { Emitter } from './emitter';
+import { Emitter } from '../lib/emitter';
 import type { IncomingMessage, OutgoingMessage } from './protocol';
 
 type SignalingEvents = {

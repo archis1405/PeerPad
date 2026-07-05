@@ -1,5 +1,5 @@
 import { ICE_SERVERS } from './config';
-import { Emitter } from './emitter';
+import { Emitter } from '../lib/emitter';
 import type { SignalingClient } from './SignalingClient';
 import type { IncomingMessage } from './protocol';
 
