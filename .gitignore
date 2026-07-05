@@ -1,0 +1,13 @@
+# OS / editor
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Go
+signaling-server/server
+signaling-server/bin/
+signaling-server/*.exe
