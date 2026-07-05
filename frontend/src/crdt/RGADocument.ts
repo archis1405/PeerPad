@@ -122,6 +122,19 @@ export class RGADocument {
       .join('');
   }
 
+  // Position of `id` among currently-visible nodes, or -1 if it doesn't
+  // exist (not yet integrated, or on the other side of a causal buffer)
+  // or is deleted. This is how UI code maps a remote op back onto a
+  // textarea offset (see CollabSession) — the CRDT itself only ever deals
+  // in ids, never positions, but the DOM only understands positions.
+  indexOf(id: OpId): number {
+    const node = this.nodesById.get(opIdKey(id));
+    if (!node || node.deleted) return -1;
+    // Fine at demo scale; a production version would keep an
+    // order-statistics structure instead of walking the whole tree per call.
+    return this.visibleNodesInOrder().findIndex((n) => n === node);
+  }
+
   // --- Internals ----------------------------------------------------------
 
   private integrateInsert(op: InsertOp): void {
