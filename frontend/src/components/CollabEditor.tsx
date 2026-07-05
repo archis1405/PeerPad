@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CollabSession, shiftOffsetForRemoteEdits } from '../collab';
+import { colorForId } from '../lib/presenceColor';
 import { SIGNALING_URL, SignalingClient, WebRTCManager } from '../net';
 
 // A pending cursor adjustment computed the moment a remote change
@@ -12,12 +13,20 @@ interface PendingSelection {
   end: number;
 }
 
+// A peer is "connecting" from the moment signaling tells us they're in
+// the room (via `joined`'s initial roster or a later `peer-joined`) until
+// their data channel actually opens. Presence intentionally reflects both
+// states rather than only fully-connected peers — otherwise a slow or
+// failing WebRTC handshake would look identical to nobody else being in
+// the room at all.
+type PresenceStatus = 'connecting' | 'connected';
+
 export function CollabEditor() {
   const [roomId, setRoomId] = useState('demo-room');
   const [connected, setConnected] = useState(false);
   const [offline, setOffline] = useState(false);
   const [myPeerId, setMyPeerId] = useState<string | null>(null);
-  const [peers, setPeers] = useState<string[]>([]);
+  const [presence, setPresence] = useState<Record<string, PresenceStatus>>({});
   const [text, setText] = useState('');
 
   const signalingRef = useRef<SignalingClient | null>(null);
@@ -58,8 +67,14 @@ export function CollabEditor() {
     managerRef.current = manager;
 
     signaling.on('message', (message) => {
+      if (message.type === 'peer-joined') {
+        setPresence((prev) => ({ ...prev, [message.peerId]: 'connecting' }));
+        return;
+      }
       if (message.type !== 'joined') return;
+
       setMyPeerId(message.peerId);
+      setPresence(Object.fromEntries((message.peers ?? []).map((peerId) => [peerId, 'connecting'])));
 
       if (sessionRef.current) {
         sessionRef.current.rebind(manager);
@@ -97,10 +112,14 @@ export function CollabEditor() {
     });
 
     manager.on('peer-connected', ({ peerId }) => {
-      setPeers((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
+      setPresence((prev) => ({ ...prev, [peerId]: 'connected' }));
     });
     manager.on('peer-disconnected', ({ peerId }) => {
-      setPeers((prev) => prev.filter((id) => id !== peerId));
+      setPresence((prev) => {
+        const next = { ...prev };
+        delete next[peerId];
+        return next;
+      });
     });
 
     signaling.connect();
@@ -121,7 +140,7 @@ export function CollabEditor() {
     setConnected(false);
     setOffline(false);
     setMyPeerId(null);
-    setPeers([]);
+    setPresence({});
     setText('');
   }
 
@@ -136,8 +155,7 @@ export function CollabEditor() {
     signalingRef.current?.close();
     managerRef.current = null;
     signalingRef.current = null;
-    setMyPeerId(null);
-    setPeers([]);
+    setPresence({});
     setOffline(true);
   }
 
@@ -151,6 +169,8 @@ export function CollabEditor() {
     sessionRef.current?.applyLocalEdit(text, newText);
     setText(newText);
   }
+
+  const peerIds = Object.keys(presence);
 
   return (
     <div style={{ textAlign: 'left', fontFamily: 'system-ui, sans-serif' }}>
@@ -169,8 +189,8 @@ export function CollabEditor() {
       </div>
 
       {connected && (
-        <div style={{ marginBottom: '0.5rem', fontFamily: 'monospace', fontSize: '0.85rem', color: '#888' }}>
-          <div>
+        <div style={{ marginBottom: '0.75rem', fontFamily: 'monospace', fontSize: '0.85rem' }}>
+          <div style={{ color: '#888', marginBottom: '0.4rem' }}>
             status:{' '}
             {offline ? (
               <strong style={{ color: '#c00' }}>OFFLINE — edits are local only until you go back online</strong>
@@ -178,8 +198,16 @@ export function CollabEditor() {
               'online'
             )}
           </div>
-          <div>peer id: {myPeerId ?? '(connecting...)'}</div>
-          <div>connected to: {peers.length ? peers.join(', ') : '(waiting for peers...)'}</div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+            {myPeerId && (
+              <PresenceRow id={myPeerId} label={`${myPeerId} (you)`} status="connected" />
+            )}
+            {peerIds.length === 0 && <span style={{ color: '#888' }}>(waiting for peers...)</span>}
+            {peerIds.map((peerId) => (
+              <PresenceRow key={peerId} id={peerId} label={peerId} status={presence[peerId]} />
+            ))}
+          </div>
         </div>
       )}
 
@@ -192,6 +220,25 @@ export function CollabEditor() {
         style={{ width: '100%', fontFamily: 'monospace', fontSize: '1rem', padding: '0.5rem' }}
         placeholder={connected ? 'Start typing...' : 'Connect to a room to start editing'}
       />
+    </div>
+  );
+}
+
+function PresenceRow({ id, label, status }: { id: string; label: string; status: PresenceStatus }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+      <span
+        style={{
+          display: 'inline-block',
+          width: '0.6rem',
+          height: '0.6rem',
+          borderRadius: '50%',
+          background: colorForId(id),
+          opacity: status === 'connected' ? 1 : 0.4,
+        }}
+      />
+      <span>{label}</span>
+      {status === 'connecting' && <span style={{ color: '#888' }}>(connecting...)</span>}
     </div>
   );
 }
