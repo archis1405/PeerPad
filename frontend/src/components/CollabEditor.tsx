@@ -55,19 +55,32 @@ export function CollabEditor() {
         // The peer id the signaling server assigned us doubles as this
         // document's RGA site id — it's already unique per connection,
         // so there's no reason to mint a second identifier.
-        const session = new CollabSession(message.peerId, manager);
-        sessionRef.current = session;
-        session.on('change', ({ text: newText, remoteEdits }) => {
-          if (remoteEdits.length > 0) {
-            const textarea = textareaRef.current;
-            if (textarea && document.activeElement === textarea) {
-              pendingSelectionRef.current = {
-                start: shiftOffsetForRemoteEdits(textarea.selectionStart, remoteEdits),
-                end: shiftOffsetForRemoteEdits(textarea.selectionEnd, remoteEdits),
-              };
-            }
+        void CollabSession.create(message.peerId, manager, roomId).then((session) => {
+          // If the user disconnected (or reconnected) while the room's
+          // history was loading, this signaling client is no longer the
+          // active one — drop the result rather than resurrect a closed
+          // session.
+          if (signalingRef.current !== signaling) {
+            session.close();
+            return;
           }
-          setText(newText);
+          sessionRef.current = session;
+          // Seed the textarea with whatever this room's persisted history
+          // (if any) replayed into the document — this is the actual
+          // "restore across refresh" moment.
+          setText(session.doc.toText());
+          session.on('change', ({ text: newText, remoteEdits }) => {
+            if (remoteEdits.length > 0) {
+              const textarea = textareaRef.current;
+              if (textarea && document.activeElement === textarea) {
+                pendingSelectionRef.current = {
+                  start: shiftOffsetForRemoteEdits(textarea.selectionStart, remoteEdits),
+                  end: shiftOffsetForRemoteEdits(textarea.selectionEnd, remoteEdits),
+                };
+              }
+            }
+            setText(newText);
+          });
         });
       }
     });
